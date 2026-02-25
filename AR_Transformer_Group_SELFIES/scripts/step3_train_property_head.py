@@ -635,6 +635,32 @@ def main(args):
         }
     )
 
+    # Save split metrics for downstream aggregation (Step3 train/val/test R² table).
+    split_metrics_df = pd.DataFrame([
+        {
+            'property': args.property,
+            'split': 'train',
+            'MAE': train_mae,
+            'RMSE': train_rmse,
+            'R2': train_r2,
+        },
+        {
+            'property': args.property,
+            'split': 'val',
+            'MAE': val_mae,
+            'RMSE': val_rmse,
+            'R2': val_r2,
+        },
+        {
+            'property': args.property,
+            'split': 'test',
+            'MAE': test_metrics['MAE'],
+            'RMSE': test_metrics['RMSE'],
+            'R2': test_metrics['R2'],
+        },
+    ])
+    split_metrics_df.to_csv(metrics_dir / f'{args.property}_split_metrics.csv', index=False)
+
     # Save data statistics using data_loader.get_statistics() for full stats
     # (includes count, unique_smiles, length_*, sa_*, and property_* stats)
     train_stats = data_loader.get_statistics(train_df, args.property)
