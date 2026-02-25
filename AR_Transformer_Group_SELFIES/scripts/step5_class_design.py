@@ -19,9 +19,8 @@ from src.utils.config import load_config, save_config
 from src.utils.plotting import PlotUtils
 from src.utils.chemistry import canonicalize_smiles, compute_sa_score
 from src.utils.model_scales import get_model_config, get_results_dir
-from src.data.tokenizer import GroupSELFIESTokenizer
-from src.model.backbone import DiffusionBackbone
-from src.model.autoregressive import AutoregressiveLM
+from src.data.hf_tokenizer import load_polymer_tokenizer
+from src.model.hf_ar import build_and_load_polymer_ar_model, resolve_ar_backbone_path
 from src.model.property_head import PropertyHead, PropertyPredictor
 from src.sampling.sampler import ConstrainedSampler
 from src.evaluation.polymer_class import PolymerClassifier, ClassGuidedDesigner
@@ -91,10 +90,7 @@ def main(args):
 
     # Load tokenizer (from base results dir which has the tokenizer)
     print("\n1. Loading tokenizer...")
-    tokenizer_path = results_dir / 'tokenizer.pkl'
-    if not tokenizer_path.exists():
-        tokenizer_path = Path(base_results_dir) / 'tokenizer.pkl'
-    tokenizer = GroupSELFIESTokenizer.load(tokenizer_path)
+    tokenizer = load_polymer_tokenizer(results_dir, Path(base_results_dir))
 
     # Load training data for novelty
     print("\n2. Loading training data...")
@@ -110,32 +106,14 @@ def main(args):
 
     # Load backbone model
     print("\n4. Loading backbone model...")
-    backbone = DiffusionBackbone(
-        vocab_size=tokenizer.vocab_size,
-        hidden_size=backbone_config['hidden_size'],
-        num_layers=backbone_config['num_layers'],
-        num_heads=backbone_config['num_heads'],
-        ffn_hidden_size=backbone_config['ffn_hidden_size'],
-        max_position_embeddings=backbone_config['max_position_embeddings'],
-        num_diffusion_steps=config['diffusion']['num_steps'],
-        dropout=backbone_config['dropout'],
-        pad_token_id=tokenizer.pad_token_id
+    checkpoint_path = resolve_ar_backbone_path(results_dir)
+    model = build_and_load_polymer_ar_model(
+        backbone_config=backbone_config,
+        tokenizer=tokenizer,
+        diffusion_config=config['diffusion'],
+        checkpoint_path=checkpoint_path,
+        map_location=device,
     )
-
-    model = AutoregressiveLM(
-        backbone=backbone,
-        pad_token_id=tokenizer.pad_token_id
-    )
-
-    backbone_ckpt = torch.load(results_dir / 'step1_backbone' / 'checkpoints' / 'backbone_best.pt', map_location=device, weights_only=False)
-    # Handle torch.compile() state dict (keys have _orig_mod. prefix)
-    state_dict = backbone_ckpt['model_state_dict']
-    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
-        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-    if any(k.startswith('backbone.') for k in state_dict.keys()):
-        model.load_state_dict(state_dict)
-    else:
-        model.backbone.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 

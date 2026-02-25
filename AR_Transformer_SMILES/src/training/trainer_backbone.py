@@ -1,4 +1,4 @@
-"""Trainer for diffusion backbone model."""
+"""Trainer for autoregressive backbone model."""
 
 import warnings
 from contextlib import nullcontext
@@ -54,8 +54,21 @@ def _supports_torch_compile(device) -> bool:
     return major >= 7
 
 
+def _extract_loss(outputs, context: str) -> torch.Tensor:
+    """Extract loss tensor from model outputs with clear failure messages."""
+    loss = getattr(outputs, "loss", None)
+    if loss is None and isinstance(outputs, dict):
+        loss = outputs.get("loss")
+    if loss is None:
+        raise ValueError(
+            f"Model outputs from {context} did not include a loss tensor. "
+            "Ensure labels are provided for causal LM training."
+        )
+    return loss
+
+
 class BackboneTrainer:
-    """Trainer for discrete masking diffusion backbone."""
+    """Trainer for autoregressive causal LM backbone."""
 
     def __init__(
         self,
@@ -74,7 +87,7 @@ class BackboneTrainer:
         """Initialize trainer.
 
         Args:
-            model: Diffusion model (backbone + diffusion process).
+            model: Autoregressive backbone model.
             train_dataloader: Training data loader.
             val_dataloader: Validation data loader.
             config: Training configuration.
@@ -401,8 +414,12 @@ class BackboneTrainer:
             # Forward pass with AMP
             self._maybe_mark_cudagraph_step_begin()
             with autocast('cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-                outputs = self.model(input_ids, attention_mask)
-                loss = outputs['loss'] / self.grad_accum_steps
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=input_ids,
+                )
+                loss = _extract_loss(outputs, context="_train_step") / self.grad_accum_steps
 
             # Backward pass with gradient scaling
             self.scaler.scale(loss).backward()
@@ -442,8 +459,12 @@ class BackboneTrainer:
 
                 self._maybe_mark_cudagraph_step_begin()
                 with autocast('cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-                    outputs = self.model(input_ids, attention_mask)
-                total_loss += outputs['loss'].item()
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=input_ids,
+                    )
+                total_loss += _extract_loss(outputs, context="_validate").item()
                 num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
