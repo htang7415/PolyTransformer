@@ -27,12 +27,12 @@ class AutoregressiveLM(nn.Module):
 
         if attention_mask is not None:
             shift_mask = attention_mask[:, 1:].contiguous()
-            shift_labels = shift_labels.masked_fill(shift_mask == 0, self.pad_token_id)
+            shift_labels = shift_labels.masked_fill(shift_mask == 0, -100)
 
         loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
-            ignore_index=self.pad_token_id
+            ignore_index=-100
         )
 
         return {'loss': loss, 'logits': logits}

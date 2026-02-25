@@ -1,10 +1,13 @@
 from .data_loader import PolymerDataLoader
 from .dataset import PolymerDataset, PropertyDataset
-from .tokenizer import PSmilesTokenizer
+from .selfies_tokenizer import SelfiesTokenizer
+from .hf_tokenizer import HFSelfiesTokenizer, load_polymer_tokenizer
 
 __all__ = [
     "PolymerDataLoader",
     "PolymerDataset",
     "PropertyDataset",
-    "PSmilesTokenizer",
+    "SelfiesTokenizer",
+    "HFSelfiesTokenizer",
+    "load_polymer_tokenizer",
 ]

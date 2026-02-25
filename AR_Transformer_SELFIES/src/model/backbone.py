@@ -217,6 +217,12 @@ class DiffusionBackbone(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
+    def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Shared token + position embedding lookup."""
+        batch_size, seq_len = input_ids.shape
+        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        return self.embedding_dropout(self.token_embedding(input_ids) + self.position_embedding(positions))
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -231,18 +237,7 @@ class DiffusionBackbone(nn.Module):
         Returns:
             Logits of shape [batch, seq_len, vocab_size].
         """
-        batch_size, seq_len = input_ids.shape
-
-        # Token embeddings
-        token_emb = self.token_embedding(input_ids)
-
-        # Position embeddings
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        pos_emb = self.position_embedding(positions)
-
-        # Combine embeddings
-        x = token_emb + pos_emb
-        x = self.embedding_dropout(x)
+        x = self._embed(input_ids)
 
         # Transformer layers
         for layer in self.layers:
@@ -270,15 +265,7 @@ class DiffusionBackbone(nn.Module):
         Returns:
             Hidden states of shape [batch, seq_len, hidden_size].
         """
-        batch_size, seq_len = input_ids.shape
-
-        # Embeddings
-        token_emb = self.token_embedding(input_ids)
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        pos_emb = self.position_embedding(positions)
-
-        x = token_emb + pos_emb
-        x = self.embedding_dropout(x)
+        x = self._embed(input_ids)
 
         # Go through layers up to layer_idx
         num_layers = len(self.layers) if layer_idx == -1 else layer_idx + 1

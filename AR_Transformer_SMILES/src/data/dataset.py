@@ -44,7 +44,7 @@ class PolymerDataset(Dataset):
         print(f"Pre-tokenizing {len(self)} samples...")
         for idx in tqdm(range(len(self)), desc="Tokenizing"):
             smiles = self.df.iloc[idx][self.smiles_col]
-            encoded = self.tokenizer.encode(
+            encoded = self.tokenizer.encode_smiles(
                 smiles,
                 add_special_tokens=True,
                 padding=True,
@@ -137,7 +137,7 @@ class PropertyDataset(Dataset):
             smiles = row[self.smiles_col]
             value = row[self.property_name]
 
-            encoded = self.tokenizer.encode(
+            encoded = self.tokenizer.encode_smiles(
                 smiles,
                 add_special_tokens=True,
                 padding=True,
