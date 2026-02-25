@@ -59,7 +59,8 @@ def plot_inverse_design(df: pd.DataFrame, output_path: Path) -> None:
     methods_reps = grouped['method'] + ' - ' + grouped['representation']
     x = np.arange(len(methods_reps))
 
-    colors = ['#1f77b4' if 'Bi_Diffusion' in m else '#ff7f0e' for m in methods_reps]
+    rep_palette = {'SMILES': '#1f77b4', 'SMILES_BPE': '#aec7e8', 'SELFIES': '#ff7f0e', 'Group_SELFIES': '#2ca02c'}
+    colors = [rep_palette.get(m.split(' - ')[-1], '#888888') for m in methods_reps]
     ax.bar(x, grouped['success_rate'], color=colors, edgecolor='black', linewidth=0.5)
 
     ax.set_xlabel('Method - Representation')

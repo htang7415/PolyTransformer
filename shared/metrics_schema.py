@@ -7,15 +7,13 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-METHOD_DIR_PREFIXES = ("Bi_Diffusion_", "AR_Transformer_")
+METHOD_DIR_PREFIXES = ("AR_Transformer_",)
 
 REPRESENTATION_ALIASES = {
     "SMILES": "SMILES",
     "SMILES_BPE": "SMILES_BPE",
     "SELFIES": "SELFIES",
     "Group_SELFIES": "Group_SELFIES",
-    "graph": "Graph",
-    "Graph": "Graph",
 }
 
 MODEL_SIZES = ("small", "medium", "large", "xl")
@@ -158,10 +156,7 @@ class MethodInfo:
 
 def parse_method_representation(folder_name: str) -> MethodInfo:
     """Infer method and representation from a method directory name."""
-    if folder_name.startswith("Bi_Diffusion_"):
-        method = "Bi_Diffusion"
-        rep = folder_name.replace("Bi_Diffusion_", "")
-    elif folder_name.startswith("AR_Transformer_"):
+    if folder_name.startswith("AR_Transformer_"):
         method = "AR_Transformer"
         rep = folder_name.replace("AR_Transformer_", "")
     else:
