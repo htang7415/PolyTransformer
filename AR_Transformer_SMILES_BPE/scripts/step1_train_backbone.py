@@ -4,7 +4,9 @@
 import os
 import sys
 import argparse
+import math
 from pathlib import Path
+from functools import partial
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -23,11 +25,19 @@ from src.utils.model_scales import (
     get_results_dir, print_model_info
 )
 from src.data.hf_tokenizer import load_polymer_tokenizer
-from src.data.dataset import PolymerDataset, collate_fn
+from src.data.dataset import PolymerDataset, collate_fn, dynamic_collate_fn
+from src.data.samplers import LengthBucketBatchSampler
 from src.model.hf_ar import build_polymer_ar_model, load_polymer_ar_checkpoint
 from src.training.trainer_backbone import BackboneTrainer
 from src.utils.reproducibility import seed_everything, save_run_metadata
 from shared.unlabeled_data import require_preprocessed_unlabeled_splits
+from shared.training_runtime import (
+    apply_cuda_allocator_settings,
+    detect_hardware_profile,
+    save_hardware_profile,
+    maybe_apply_hardware_aware_batching,
+    maybe_apply_cpu_oom_guards,
+)
 
 
 def init_distributed():
@@ -50,16 +60,107 @@ def init_distributed():
     return True, rank, world_size, local_rank, device
 
 
+def _nearest_power_of_two(value: float) -> int:
+    """Round positive value to nearest power of two."""
+    return int(2 ** round(math.log2(max(1.0, float(value)))))
+
+
+def _estimate_scaling_params(backbone_config: dict, vocab_size: int) -> int:
+    """Estimate nanochat-style scaling params: transformer matrices + lm_head."""
+    hidden_size = int(backbone_config['hidden_size'])
+    num_layers = int(backbone_config['num_layers'])
+    ffn_hidden_size = int(backbone_config['ffn_hidden_size'])
+
+    attn_params = 4 * hidden_size * hidden_size
+    ffn_params = 2 * hidden_size * ffn_hidden_size
+    ln_params = 4 * hidden_size
+    transformer_params = num_layers * (attn_params + ffn_params + ln_params)
+    lm_head_params = vocab_size * hidden_size
+    return int(transformer_params + lm_head_params)
+
+
+def _maybe_apply_compute_optimal_scaling(
+    config: dict,
+    backbone_config: dict,
+    vocab_size: int,
+    world_size: int,
+    is_main_process: bool,
+) -> None:
+    """Apply nanochat-style compute-optimal scaling for max_steps and LR."""
+    opt_cfg = config.get('optimization', {})
+    if not bool(opt_cfg.get('compute_optimal_scaling', False)):
+        return
+
+    target_ratio = float(opt_cfg.get('compute_opt_target_param_data_ratio', 10.5))
+    if target_ratio <= 0:
+        raise ValueError("optimization.compute_opt_target_param_data_ratio must be > 0.")
+
+    seq_len_tokens = int(
+        opt_cfg.get(
+            'compute_opt_seq_len_tokens',
+            backbone_config.get(
+                'max_position_embeddings',
+                config.get('backbone', {}).get('max_position_embeddings', 256),
+            ),
+        )
+    )
+    if seq_len_tokens <= 0:
+        raise ValueError("optimization.compute_opt_seq_len_tokens must be > 0.")
+
+    global_batch_samples = int(
+        config['training_backbone']['batch_size'] *
+        config['optimization']['gradient_accumulation_steps'] *
+        world_size
+    )
+    if global_batch_samples <= 0:
+        raise ValueError("Global batch samples must be > 0 for compute-optimal scaling.")
+    global_batch_tokens = global_batch_samples * seq_len_tokens
+
+    scaling_params = _estimate_scaling_params(backbone_config, vocab_size)
+    target_tokens = int(target_ratio * scaling_params)
+    target_max_steps = max(1, target_tokens // max(1, global_batch_tokens))
+    prev_max_steps = int(config['training_backbone']['max_steps'])
+    config['training_backbone']['max_steps'] = target_max_steps
+
+    warmup_ratio = float(opt_cfg.get('compute_opt_warmup_ratio', -1.0))
+    if warmup_ratio >= 0.0:
+        config['training_backbone']['warmup_steps'] = max(1, int(round(target_max_steps * warmup_ratio)))
+
+    lr_scale = 1.0
+    if bool(opt_cfg.get('compute_opt_lr_batch_scaling', True)):
+        ref_global_batch_tokens = int(opt_cfg.get('compute_opt_ref_global_batch_tokens', 0))
+        if ref_global_batch_tokens <= 0:
+            ref_global_batch_samples = int(opt_cfg.get('auto_batch_ref_global_batch', 1024))
+            ref_global_batch_tokens = max(1, ref_global_batch_samples * seq_len_tokens)
+
+        lr_scale = math.sqrt(float(global_batch_tokens) / float(ref_global_batch_tokens))
+        config['training_backbone']['learning_rate'] = float(config['training_backbone']['learning_rate']) * lr_scale
+        for lr_key in ['adam_embedding_lr', 'adam_unembedding_lr', 'adam_scalar_lr', 'muon_matrix_lr']:
+            if lr_key in config['optimization']:
+                config['optimization'][lr_key] = float(config['optimization'][lr_key]) * lr_scale
+
+    if is_main_process:
+        print(
+            "Compute-optimal scaling enabled: "
+            f"scaling_params={scaling_params:,}, target_tokens={target_tokens:,}, "
+            f"global_batch_tokens={global_batch_tokens:,}, max_steps={target_max_steps:,} "
+            f"(was {prev_max_steps:,}), lr_scale={lr_scale:.4f}"
+        )
+
+
 def main(args):
     """Main function."""
     # Load config
     config = load_config(args.config)
+    preflight_is_main = int(os.environ.get("RANK", "0") or 0) == 0
+    apply_cuda_allocator_settings(config.get('optimization', {}), preflight_is_main)
 
     distributed, rank, world_size, local_rank, dist_device = init_distributed()
     is_main_process = (not distributed) or rank == 0
 
     # Set device
     device = dist_device if distributed else ('cuda' if torch.cuda.is_available() else 'cpu')
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1)
     if is_main_process:
         print(f"Using device: {device}")
 
@@ -71,6 +172,27 @@ def main(args):
     figures_dir = step_dir / 'figures'
     metrics_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
+    hardware_profile = detect_hardware_profile(
+        world_size=world_size,
+        local_world_size=local_world_size,
+        device=device,
+        distributed=distributed,
+    )
+    if is_main_process:
+        save_hardware_profile(metrics_dir / 'hardware_profile.json', hardware_profile)
+        gpu_mem_min = float(hardware_profile.get('gpu_mem_gb_min', 0.0))
+        gpu_mem_max = float(hardware_profile.get('gpu_mem_gb_max', 0.0))
+        gpu_desc = "cpu-only"
+        if gpu_mem_min > 0.0:
+            gpu_desc = (
+                f"{world_size} training GPU(s), visible_local={hardware_profile.get('visible_gpu_count', 0)}, "
+                f"memory_range={gpu_mem_min:.1f}-{gpu_mem_max:.1f}GB"
+            )
+        print(
+            "Detected hardware: "
+            f"{gpu_desc}, local_world_size={local_world_size}, "
+            f"cpu_mem_per_rank~{float(hardware_profile.get('cpu_mem_gb_per_rank_est', 0.0)):.1f}GB"
+        )
 
     # Reproducibility
     seed_info = seed_everything(config['data']['random_seed'])
@@ -94,12 +216,70 @@ def main(args):
         config['training_backbone']['warmup_steps'] = training_config['warmup_steps']
         config['optimization']['gradient_accumulation_steps'] = training_config['gradient_accumulation_steps']
 
+    maybe_apply_hardware_aware_batching(
+        config=config,
+        backbone_config=backbone_config,
+        hardware_profile=hardware_profile,
+        world_size=world_size,
+        is_main_process=is_main_process,
+    )
+
+    # Optional nanochat-style auto global batch scaling from model depth.
+    opt_cfg = config.get('optimization', {})
+    if bool(opt_cfg.get('auto_batch_scaling', False)):
+        ref_depth = max(1.0, float(opt_cfg.get('auto_batch_ref_depth', 6)))
+        ref_global_batch = max(1.0, float(opt_cfg.get('auto_batch_ref_global_batch', 1024)))
+        exponent = float(opt_cfg.get('auto_batch_exponent', 0.766))
+        round_pow2 = bool(opt_cfg.get('auto_batch_power_of_two', True))
+
+        depth = float(backbone_config.get('num_layers', config['backbone']['num_layers']))
+        target_global_batch = ref_global_batch * ((depth / ref_depth) ** exponent)
+        if round_pow2:
+            target_global_batch = float(_nearest_power_of_two(target_global_batch))
+
+        per_micro_global = float(config['training_backbone']['batch_size'] * world_size)
+        auto_grad_accum = max(1, int(round(target_global_batch / max(1.0, per_micro_global))))
+        config['optimization']['gradient_accumulation_steps'] = auto_grad_accum
+        achieved_global_batch = int(config['training_backbone']['batch_size'] * auto_grad_accum * world_size)
+
+        if is_main_process:
+            print(
+                "Auto batch scaling enabled: "
+                f"depth={int(depth)}, target_global_batch={int(target_global_batch)}, "
+                f"grad_accum={auto_grad_accum}, achieved_global_batch={achieved_global_batch}"
+            )
+
     # Load tokenizer (from base results dir which has the tokenizer)
     if is_main_process:
         print("\n1. Loading tokenizer...")
     tokenizer = load_polymer_tokenizer(results_dir, Path(base_results_dir))
     if is_main_process:
         print(f"Vocabulary size: {tokenizer.vocab_size}")
+
+    # Optional nanochat-style compute-optimal scaling for max_steps and learning rates.
+    _maybe_apply_compute_optimal_scaling(
+        config=config,
+        backbone_config=backbone_config,
+        vocab_size=tokenizer.vocab_size,
+        world_size=world_size,
+        is_main_process=is_main_process,
+    )
+
+    # Keep a single effective training_config view after all runtime overrides.
+    training_config = {
+        'batch_size': int(config['training_backbone']['batch_size']),
+        'learning_rate': float(config['training_backbone']['learning_rate']),
+        'max_steps': int(config['training_backbone']['max_steps']),
+        'warmup_steps': int(config['training_backbone']['warmup_steps']),
+        'gradient_accumulation_steps': int(config['optimization']['gradient_accumulation_steps']),
+    }
+    if is_main_process:
+        effective_global_batch = (
+            training_config['batch_size'] *
+            training_config['gradient_accumulation_steps'] *
+            world_size
+        )
+        print(f"Effective global batch (samples/update): {effective_global_batch}")
 
     # Print model info if model_size specified
     if args.model_size and is_main_process:
@@ -159,9 +339,13 @@ def main(args):
     step1_persistent_workers = bool(
         opt_config.get('step1_persistent_workers', opt_config.get('persistent_workers', False))
     )
+    dynamic_padding = bool(opt_config.get('dynamic_padding', False))
+    length_bucket_sampler = bool(opt_config.get('length_bucket_sampler', False))
+    bucket_size_multiplier = int(opt_config.get('bucket_size_multiplier', 50))
+    if bucket_size_multiplier <= 0:
+        raise ValueError("optimization.bucket_size_multiplier must be > 0.")
 
     # Bound DataLoader workers to per-rank CPU budget to avoid oversubscription.
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1)
     slurm_cpus_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", "0") or 0)
     host_cpus = os.cpu_count() or 1
     if slurm_cpus_per_task > 0:
@@ -183,6 +367,15 @@ def main(args):
                 f"(cpu_budget={per_rank_cpu_budget}, local_world_size={local_world_size})"
             )
         num_workers = per_rank_worker_cap
+    num_workers, prefetch_factor, pin_memory = maybe_apply_cpu_oom_guards(
+        opt_cfg=opt_config,
+        hardware_profile=hardware_profile,
+        local_world_size=local_world_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        pin_memory=pin_memory,
+        is_main_process=is_main_process,
+    )
     persistent_workers = step1_persistent_workers and num_workers > 0
 
     # Guard against memory blow-up: full-cache can be too large for multi-million datasets.
@@ -200,30 +393,66 @@ def main(args):
         cache_tokenization = False
 
     # Create datasets
-    train_dataset = PolymerDataset(train_df, tokenizer, cache_tokenization=cache_tokenization)
-    val_dataset = PolymerDataset(val_df, tokenizer, cache_tokenization=cache_tokenization)
+    train_dataset = PolymerDataset(
+        train_df,
+        tokenizer,
+        cache_tokenization=cache_tokenization,
+        pad_to_max_length=not dynamic_padding,
+    )
+    val_dataset = PolymerDataset(
+        val_df,
+        tokenizer,
+        cache_tokenization=cache_tokenization,
+        pad_to_max_length=not dynamic_padding,
+    )
+
+    active_collate_fn = collate_fn
+    if dynamic_padding:
+        active_collate_fn = partial(dynamic_collate_fn, pad_token_id=tokenizer.pad_token_id)
 
     # Create dataloaders
     batch_size = config['training_backbone']['batch_size']
-    train_sampler = DistributedSampler(train_dataset, shuffle=True) if distributed else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if distributed else None
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        persistent_workers=persistent_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None
-    )
+    if length_bucket_sampler:
+        train_lengths = train_df['p_smiles'].astype(str).str.len().tolist()
+        train_batch_sampler = LengthBucketBatchSampler(
+            lengths=train_lengths,
+            batch_size=batch_size,
+            drop_last=False,
+            shuffle=True,
+            seed=config['data']['random_seed'],
+            bucket_size_multiplier=bucket_size_multiplier,
+            num_replicas=world_size if distributed else 1,
+            rank=rank if distributed else 0,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            collate_fn=active_collate_fn,
+            num_workers=num_workers,
+            persistent_workers=persistent_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None
+        )
+    else:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True) if distributed else None
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            collate_fn=active_collate_fn,
+            num_workers=num_workers,
+            persistent_workers=persistent_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler,
-        collate_fn=collate_fn,
+        collate_fn=active_collate_fn,
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
@@ -233,6 +462,12 @@ def main(args):
     if is_main_process:
         print(f"Train batches: {len(train_loader)}")
         print(f"Val batches: {len(val_loader)}")
+        if dynamic_padding:
+            print("Using dynamic batch padding for Step1 dataloaders.")
+        if length_bucket_sampler:
+            print(
+                f"Using length-bucket batching (bucket_size_multiplier={bucket_size_multiplier})."
+            )
         print(f"DataLoader workers per rank: {num_workers}")
 
     # Create model
@@ -289,6 +524,34 @@ def main(args):
             ylabel='Loss',
             title='Backbone Training Loss',
             save_path=figures_dir / 'backbone_loss_curve.png'
+        )
+
+        # Convert nats/token to bits/token (BpB) and plot against epoch progress.
+        inv_ln2 = 1.0 / math.log(2.0)
+        train_bpb = [loss * inv_ln2 for loss in history['train_losses']]
+        val_bpb = [loss * inv_ln2 for loss in history['val_losses']]
+
+        micro_batches_per_epoch = max(1, len(train_loader))
+        train_epochs = [
+            (idx + 1) / micro_batches_per_epoch
+            for idx in range(len(train_bpb))
+        ]
+        grad_accum_steps = max(1, int(config['optimization']['gradient_accumulation_steps']))
+        update_steps_per_epoch = max(1, math.ceil(micro_batches_per_epoch / grad_accum_steps))
+        val_steps = history.get('val_steps', [])
+        val_epochs = None
+        if val_bpb and val_steps and len(val_bpb) == len(val_steps):
+            val_epochs = [step / update_steps_per_epoch for step in val_steps]
+
+        plotter.loss_curve(
+            train_losses=train_bpb,
+            val_losses=val_bpb,
+            xlabel='Epoch',
+            ylabel='BpB',
+            title='Backbone Training BpB',
+            save_path=figures_dir / 'backbone_bpb_curve.png',
+            train_x=train_epochs,
+            val_x=val_epochs
         )
 
         # Export best checkpoint in HF-pretrained format.

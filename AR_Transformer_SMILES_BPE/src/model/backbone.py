@@ -23,14 +23,12 @@ class MultiHeadAttention(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.scale = self.head_dim ** -0.5
-
         self.q_proj = nn.Linear(hidden_size, hidden_size)
         self.k_proj = nn.Linear(hidden_size, hidden_size)
         self.v_proj = nn.Linear(hidden_size, hidden_size)
         self.out_proj = nn.Linear(hidden_size, hidden_size)
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout_p = float(dropout)
         self.causal = causal
 
     def forward(
@@ -54,28 +52,28 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Compute attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        # Apply causal mask to prevent attention to future tokens
-        if self.causal:
-            causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=attn_scores.device, dtype=torch.bool),
-                diagonal=1
-            )
-            attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
-
-        # Apply attention mask (mask padding only)
+        # SDPA dispatches to flash/memory-efficient kernels on H100 where possible.
+        attn_mask = None
+        is_causal = self.causal
         if attention_mask is not None:
-            # Expand mask: [batch, seq_len] -> [batch, 1, 1, seq_len]
-            mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+            # Expand mask [batch, seq_len] -> [batch, 1, 1, seq_len].
+            # SDPA interprets boolean masks as True=attend, False=masked.
+            key_mask = attention_mask.to(dtype=torch.bool).unsqueeze(1).unsqueeze(2)
+            if self.causal:
+                causal_mask = torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool).tril()
+                attn_mask = key_mask & causal_mask.unsqueeze(0).unsqueeze(0)
+                is_causal = False
+            else:
+                attn_mask = key_mask
 
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
-
-        # Apply attention to values
-        out = torch.matmul(attn_probs, v)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=is_causal,
+        )
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
 
         return self.out_proj(out)

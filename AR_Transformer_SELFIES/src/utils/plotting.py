@@ -193,7 +193,9 @@ class PlotUtils:
         ylabel: str = "Loss",
         title: Optional[str] = None,
         save_path: Optional[str] = None,
-        log_scale: bool = False
+        log_scale: bool = False,
+        train_x: Optional[List[float]] = None,
+        val_x: Optional[List[float]] = None
     ) -> plt.Figure:
         """Create loss curve plot.
 
@@ -205,21 +207,29 @@ class PlotUtils:
             title: Plot title.
             save_path: Path to save the figure.
             log_scale: Whether to use log scale for y-axis.
+            train_x: Optional x-axis values for training curve.
+            val_x: Optional x-axis values for validation curve.
 
         Returns:
             Matplotlib figure.
         """
         fig, ax = plt.subplots(figsize=self.figure_size)
 
-        steps = np.arange(1, len(train_losses) + 1)
+        if train_x is not None and len(train_x) == len(train_losses):
+            steps = np.asarray(train_x)
+        else:
+            steps = np.arange(1, len(train_losses) + 1)
         ax.plot(steps, train_losses, label='Train', color='blue')
 
         if val_losses:
-            val_steps = np.arange(1, len(val_losses) + 1)
-            # Adjust for different lengths (e.g., eval every N steps)
-            if len(val_losses) < len(train_losses):
-                ratio = len(train_losses) // len(val_losses)
-                val_steps = val_steps * ratio
+            if val_x is not None and len(val_x) == len(val_losses):
+                val_steps = np.asarray(val_x)
+            else:
+                val_steps = np.arange(1, len(val_losses) + 1)
+                # Adjust for different lengths (e.g., eval every N steps)
+                if len(val_losses) < len(train_losses):
+                    ratio = len(train_losses) // len(val_losses)
+                    val_steps = val_steps * ratio
             ax.plot(val_steps, val_losses, label='Validation', color='orange')
 
         ax.set_xlabel(xlabel)

@@ -12,7 +12,7 @@ VALID_SIZES = ['small', 'medium', 'large', 'xl']
 # Sequence model scales (for p-SMILES, SELFIES, Group SELFIES)
 SEQUENCE_MODEL_SCALES = {
     'small': {
-        # Architecture (~12M params)
+        # Architecture (depth-driven)
         'hidden_size': 384,
         'num_layers': 6,
         'num_heads': 6,
@@ -27,11 +27,11 @@ SEQUENCE_MODEL_SCALES = {
         'learning_rate': 3.0e-4,
     },
     'medium': {
-        # Architecture (~50M params)
-        'hidden_size': 640,
-        'num_layers': 10,
-        'num_heads': 10,
-        'ffn_hidden_size': 2560,
+        # Architecture (depth-driven)
+        'hidden_size': 768,
+        'num_layers': 12,
+        'num_heads': 12,
+        'ffn_hidden_size': 3072,
         'dropout': 0.1,
         'max_position_embeddings': 256,
         # Training
@@ -42,11 +42,11 @@ SEQUENCE_MODEL_SCALES = {
         'learning_rate': 3.0e-4,
     },
     'large': {
-        # Architecture (~150M params)
-        'hidden_size': 960,
-        'num_layers': 14,
-        'num_heads': 12,
-        'ffn_hidden_size': 3840,
+        # Architecture (depth-driven)
+        'hidden_size': 1152,
+        'num_layers': 18,
+        'num_heads': 18,
+        'ffn_hidden_size': 4608,
         'dropout': 0.1,
         'max_position_embeddings': 256,
         # Training
@@ -57,11 +57,11 @@ SEQUENCE_MODEL_SCALES = {
         'learning_rate': 1.0e-4,
     },
     'xl': {
-        # Architecture (~400M params)
-        'hidden_size': 1280,
-        'num_layers': 20,
-        'num_heads': 16,
-        'ffn_hidden_size': 5120,
+        # Architecture (depth-driven)
+        'hidden_size': 1536,
+        'num_layers': 24,
+        'num_heads': 24,
+        'ffn_hidden_size': 6144,
         'dropout': 0.1,
         'max_position_embeddings': 256,
         # Training
