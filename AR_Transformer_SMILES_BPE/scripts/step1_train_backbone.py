@@ -5,6 +5,8 @@ import os
 import sys
 import argparse
 import math
+import json
+import time
 from pathlib import Path
 from functools import partial
 
@@ -506,10 +508,42 @@ def main(args):
     )
 
     # Train
+    train_start_time = time.perf_counter()
     history = trainer.train()
+    train_time_seconds = time.perf_counter() - train_start_time
 
     # Create loss plot
     if is_main_process:
+        final_train_loss = history['train_losses'][-1] if history.get('train_losses') else None
+        final_val_loss = history['val_losses'][-1] if history.get('val_losses') else None
+        history_payload = {
+            'train_losses': [final_train_loss] if final_train_loss is not None else [],
+            'val_losses': history.get('val_losses', []),
+            'val_steps': history.get('val_steps', []),
+            'final_train_loss': final_train_loss,
+            'final_val_loss': final_val_loss,
+            'best_val_loss': history.get('best_val_loss'),
+            'training_time_seconds': round(float(train_time_seconds), 2),
+            'training_time_hours': round(float(train_time_seconds) / 3600.0, 4),
+            'num_parameters': int(num_params),
+            'num_trainable_parameters': int(num_trainable),
+            'global_steps': int(getattr(trainer, 'global_step', 0)),
+            'micro_steps': int(getattr(trainer, 'micro_step', 0)),
+            'effective_global_batch_samples': int(
+                config['training_backbone']['batch_size'] *
+                config['optimization']['gradient_accumulation_steps'] *
+                world_size
+            ),
+            'model_size': args.model_size,
+        }
+        with open(metrics_dir / 'backbone_training_history.json', 'w', encoding='utf-8') as handle:
+            json.dump(history_payload, handle, indent=2)
+        print(
+            "Step1 summary saved: "
+            f"time={train_time_seconds:.1f}s, "
+            f"params={num_params:,}, trainable={num_trainable:,}"
+        )
+
         print("\n5. Creating loss plot...")
         plotter = PlotUtils(
             figure_size=tuple(config['plotting']['figure_size']),
