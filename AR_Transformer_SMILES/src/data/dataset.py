@@ -69,7 +69,7 @@ class PolymerDataset(Dataset):
         smiles = self.df.iloc[idx][self.smiles_col]
 
         # Encode SMILES
-        encoded = self.tokenizer.encode(
+        encoded = self.tokenizer.encode_smiles(
             smiles,
             add_special_tokens=True,
             padding=self.pad_to_max_length,
@@ -170,7 +170,7 @@ class PropertyDataset(Dataset):
         value = row[self.property_name]
 
         # Encode SMILES
-        encoded = self.tokenizer.encode(
+        encoded = self.tokenizer.encode_smiles(
             smiles,
             add_special_tokens=True,
             padding=True,

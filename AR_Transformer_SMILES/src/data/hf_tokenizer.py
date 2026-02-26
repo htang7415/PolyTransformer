@@ -167,8 +167,21 @@ class HFPSmilesTokenizer(PreTrainedTokenizer):
     # ------------------------------------------------------------------
     # Pipeline APIs (kept stable to avoid behavioral changes in scripts).
     # ------------------------------------------------------------------
-    def tokenize(self, smiles: str) -> List[str]:  # type: ignore[override]
-        return self._tokenize(smiles)
+    def tokenize(
+        self,
+        text: str,
+        pair: Optional[str] = None,
+        add_special_tokens: bool = False,
+        **kwargs,
+    ) -> List[str]:  # type: ignore[override]
+        """HF-compatible tokenize signature for forward kwargs compatibility."""
+        if pair is not None:
+            raise NotImplementedError("Pair sequences are not supported for p-SMILES tokenizer.")
+
+        tokens = self._tokenize(text)
+        if add_special_tokens:
+            tokens = [self.bos_token] + tokens + [self.eos_token]
+        return tokens
 
     def detokenize(self, tokens: List[str]) -> str:
         filtered = [t for t in tokens if t not in self.SPECIAL_TOKENS]
